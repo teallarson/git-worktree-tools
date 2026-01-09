@@ -16,9 +16,11 @@ Streamline working with git worktrees by providing easy access to worktree creat
 - User mentions "worktree", "parallel branches", or "multiple features"
 
 ## Prerequisites
-The worktree management scripts are located at `/Users/teal/workspace/git-worktree-tools/`:
+The worktree management scripts should be available in your PATH:
 - `worktree-create` - Creates worktrees with .env syncing
 - `worktree-manage` - Manages existing worktrees
+
+Users should install these tools from https://github.com/teallarson/git-worktree-tools and add them to their PATH, or use the full path to the scripts when executing commands.
 
 ## Core Concepts
 
@@ -37,7 +39,7 @@ To make .env files independent, use the `materialize` command to convert symlink
 Use the `worktree-create` script:
 
 ```bash
-/Users/teal/workspace/git-worktree-tools/worktree-create [OPTIONS] <branch-name>
+worktree-create [OPTIONS] <branch-name>
 ```
 
 **Common options:**
@@ -56,7 +58,7 @@ Use the `worktree-create` script:
 Use the `worktree-manage list` command:
 
 ```bash
-/Users/teal/workspace/git-worktree-tools/worktree-manage list
+worktree-manage list
 ```
 
 Shows:
@@ -70,10 +72,10 @@ Convert symlinked .env files to real, independent copies:
 
 ```bash
 # Materialize one worktree
-/Users/teal/workspace/git-worktree-tools/worktree-manage materialize <branch-name>
+worktree-manage materialize <branch-name>
 
 # Materialize all worktrees
-/Users/teal/workspace/git-worktree-tools/worktree-manage materialize-all
+worktree-manage materialize-all
 ```
 
 Use when:
@@ -86,7 +88,7 @@ Use when:
 Use the `worktree-manage remove` command:
 
 ```bash
-/Users/teal/workspace/git-worktree-tools/worktree-manage remove <branch-name>
+worktree-manage remove <branch-name>
 ```
 
 This will:
@@ -102,8 +104,8 @@ This will:
 **Steps:**
 1. Create worktrees for each feature:
    ```bash
-   /Users/teal/workspace/git-worktree-tools/worktree-create feature-payments
-   /Users/teal/workspace/git-worktree-tools/worktree-create feature-notifications
+   worktree-create feature-payments
+   worktree-create feature-notifications
    ```
 
 2. Work in each independently:
@@ -124,7 +126,7 @@ This will:
 **Steps:**
 1. Create hotfix worktree from main:
    ```bash
-   /Users/teal/workspace/git-worktree-tools/worktree-create -b main hotfix-urgent-bug
+   worktree-create -b main hotfix-urgent-bug
    ```
 
 2. Fix bug in isolation:
@@ -142,13 +144,13 @@ This will:
 **Steps:**
 1. Create worktree with independent .env:
    ```bash
-   /Users/teal/workspace/git-worktree-tools/worktree-create --copy-env experiment-config
+   worktree-create --copy-env experiment-config
    ```
 
 2. Or create with synced .env, then materialize:
    ```bash
-   /Users/teal/workspace/git-worktree-tools/worktree-create experiment-config
-   /Users/teal/workspace/git-worktree-tools/worktree-manage materialize experiment-config
+   worktree-create experiment-config
+   worktree-manage materialize experiment-config
    ```
 
 3. Modify .env in the worktree independently:
@@ -164,13 +166,13 @@ This will:
 **Steps:**
 1. List what exists:
    ```bash
-   /Users/teal/workspace/git-worktree-tools/worktree-manage list
+   worktree-manage list
    ```
 
 2. Remove completed worktrees:
    ```bash
-   /Users/teal/workspace/git-worktree-tools/worktree-manage remove feature-payments
-   /Users/teal/workspace/git-worktree-tools/worktree-manage remove hotfix-urgent-bug
+   worktree-manage remove feature-payments
+   worktree-manage remove hotfix-urgent-bug
    ```
 
 3. Prompts will ask about deleting branches too
@@ -213,17 +215,19 @@ Recommend adding `.worktrees/` to `.gitignore`.
 ## Troubleshooting
 
 ### Scripts Not Found
-If scripts aren't found, verify the path:
+If scripts aren't found, verify they are in your PATH:
 ```bash
-ls -la /Users/teal/workspace/git-worktree-tools/
+which worktree-create worktree-manage
 ```
 
-Should show `worktree-create` and `worktree-manage` as executable.
+If not in PATH, either:
+- Add the installation directory to your PATH
+- Use the full path to the scripts (e.g., `/path/to/git-worktree-tools/worktree-create`)
 
 ### Permission Denied
 Make scripts executable:
 ```bash
-chmod +x /Users/teal/workspace/git-worktree-tools/worktree-*
+chmod +x /path/to/git-worktree-tools/worktree-*
 ```
 
 ### Base Branch Doesn't Exist
@@ -267,7 +271,7 @@ The custom scripts enhance these with .env syncing and better UX.
 User: "I want to work on a new authentication feature"
 
 Response: I'll create a worktree for the authentication feature.
-[Execute: /Users/teal/workspace/git-worktree-tools/worktree-create feature-auth]
+[Execute: worktree-create feature-auth]
 
 Your worktree is ready at .worktrees/feature-auth with .env files synced.
 To start working:
@@ -279,7 +283,7 @@ To start working:
 User: "I need to fix a production bug but I have uncommitted changes"
 
 Response: I'll create a hotfix worktree from the main branch so your current work isn't disrupted.
-[Execute: /Users/teal/workspace/git-worktree-tools/worktree-create -b main hotfix-login-bug]
+[Execute: worktree-create -b main hotfix-login-bug]
 
 Your hotfix worktree is ready. You can work on the fix while your original work remains untouched.
 ```
@@ -289,7 +293,7 @@ Your hotfix worktree is ready. You can work on the fix while your original work 
 User: "What worktrees do I have?"
 
 Response: Let me list your worktrees.
-[Execute: /Users/teal/workspace/git-worktree-tools/worktree-manage list]
+[Execute: worktree-manage list]
 
 You have 3 worktrees. Would you like to remove any that are no longer needed?
 ```
@@ -299,13 +303,13 @@ You have 3 worktrees. Would you like to remove any that are no longer needed?
 User: "I want to test with different database settings"
 
 Response: I'll create a worktree with independent .env files so you can modify settings without affecting other worktrees.
-[Execute: /Users/teal/workspace/git-worktree-tools/worktree-create --copy-env experiment-db-config]
+[Execute: worktree-create --copy-env experiment-db-config]
 
 Your worktree has independent .env files. You can now modify environment variables without affecting other worktrees.
 ```
 
 ## Notes
-- These scripts are located at `/Users/teal/workspace/git-worktree-tools/`
 - Source code: https://github.com/teallarson/git-worktree-tools
 - Scripts require Git 2.5+ for worktree support
 - Always verify the user is in a git repository before executing commands
+- If scripts are not in PATH, Claude should use the full path provided by the user or check common installation locations
