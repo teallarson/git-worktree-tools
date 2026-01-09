@@ -32,6 +32,35 @@ chmod +x worktree-create worktree-manage
 export PATH="$PATH:/path/to/git-worktree-tools"
 ```
 
+## Claude Code Integration
+
+If you use [Claude Code](https://claude.com/claude-code), you can install the included skill for an enhanced workflow:
+
+```bash
+# Copy the skill to your Claude Code skills directory
+cp -r .claude/skills/worktree ~/.claude/skills/
+
+# Restart Claude Code to load the skill
+```
+
+Now Claude can help you manage worktrees naturally:
+
+```
+"Create a worktree for my new authentication feature"
+"Show me my current worktrees"
+"Make the .env files independent in my experiment branch"
+```
+
+Or invoke the skill directly with `/worktree`
+
+The skill provides Claude with:
+- Automatic detection of when to use worktrees
+- Knowledge of common workflows (parallel dev, hotfixes, experiments)
+- Understanding of .env syncing and materialization
+- Troubleshooting guidance
+
+See `.claude/skills/worktree/SKILL.md` for full details.
+
 ## Quick Start
 
 ```bash
