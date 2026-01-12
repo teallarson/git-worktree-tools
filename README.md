@@ -327,35 +327,14 @@ Override which files get synced (default: `.env*`):
 # Only sync the main .env file
 WORKTREE_ENV_PATTERN='.env' worktree-create my-feature
 
-# Sync multiple specific files
-WORKTREE_ENV_PATTERN='.env' worktree-create my-feature
+# Sync config files instead
+WORKTREE_ENV_PATTERN='config.*' worktree-create my-feature
 
 # Also works with worktree-manage
 WORKTREE_ENV_PATTERN='config.*' worktree-manage list
-```
 
-### WORKTREE_ENV_EXCLUDE
-
-Exclude specific files from syncing (comma-separated):
-
-```bash
-# Exclude local overrides
-WORKTREE_ENV_EXCLUDE='.env.local' worktree-create my-feature
-
-# Exclude multiple patterns
-WORKTREE_ENV_EXCLUDE='.env.local,.env.test' worktree-create my-feature
-```
-
-### Examples
-
-```bash
 # Only sync production env files
 WORKTREE_ENV_PATTERN='.env.production*' worktree-create prod-test
-
-# Sync all config files except local ones
-WORKTREE_ENV_PATTERN='config.*' \
-WORKTREE_ENV_EXCLUDE='config.local' \
-worktree-create my-feature
 
 # Make it permanent in your shell profile
 echo 'export WORKTREE_ENV_PATTERN=".env"' >> ~/.bashrc
