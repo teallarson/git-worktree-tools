@@ -240,6 +240,237 @@ A: No! Add `.worktrees/` to your `.gitignore`.
 **Q: What if my team uses a different base branch?**
 A: Use `-b`: `worktree-create -b develop my-feature`
 
+**Q: Are the tools safe for concurrent operations?**
+A: Yes! The scripts use file-based locking to prevent race conditions when running multiple operations simultaneously. See [Concurrent Operations](#concurrent-operations-and-locking) for details.
+
+**Q: How do I secure my environment files?**
+A: The tools validate permissions and warn you if `.env` files are world-readable. See [Security Considerations](#security-considerations) for best practices.
+
+## Security Considerations
+
+### Environment File Permissions
+
+By default, `.env` files are symlinked from your main repository to all worktrees. This means:
+
+- All worktrees share the same sensitive configuration
+- File permissions apply to all worktrees
+- Changes in one worktree affect all others
+
+**Best Practices:**
+
+```bash
+# Set restrictive permissions on .env files
+chmod 600 .env*
+
+# Verify permissions
+ls -la .env*
+
+# Or use independent copies for sensitive worktrees
+worktree-create --copy-env sensitive-feature
+```
+
+The `worktree-create` script will automatically check file permissions and warn you if `.env` files are world-readable (permissions > 600). You'll be prompted to continue or abort.
+
+### Input Validation
+
+Branch names are validated according to git's rules. The following characters are **prohibited**:
+- `\` (backslash)
+- `~` (tilde)
+- `^` (caret)
+- `:` (colon)
+- `?` (question mark)
+- `*` (asterisk)
+- `[` `]` (brackets)
+- `@{` (at-brace sequence)
+
+Branch names also cannot:
+- Start or end with `/` or `.`
+- Contain `..` or `//` sequences
+- Be empty or exceed 255 characters
+
+### Concurrent Operations and Locking
+
+The tools use file-based locking to prevent race conditions when multiple operations run simultaneously:
+
+```bash
+# Lock file location
+.git/worktree-tools.lock
+
+# If you see "lock file exists" error:
+# 1. Check if another operation is running
+ps aux | grep worktree
+
+# 2. If not, remove the stale lock
+rm .git/worktree-tools.lock
+```
+
+The lock is automatically released when operations complete or if the process is interrupted.
+
+### Error Rollback
+
+If worktree creation fails partway through (e.g., during `.env` file setup), the script automatically:
+- Removes the partially created worktree
+- Deletes any newly created branches
+- Leaves your repository in a clean state
+
+No manual cleanup required!
+
+## Environment Variables
+
+Customize the tools' behavior with environment variables:
+
+### WORKTREE_ENV_PATTERN
+
+Override which files get synced (default: `.env*`):
+
+```bash
+# Only sync the main .env file
+WORKTREE_ENV_PATTERN='.env' worktree-create my-feature
+
+# Sync multiple specific files
+WORKTREE_ENV_PATTERN='.env' worktree-create my-feature
+
+# Also works with worktree-manage
+WORKTREE_ENV_PATTERN='config.*' worktree-manage list
+```
+
+### WORKTREE_ENV_EXCLUDE
+
+Exclude specific files from syncing (comma-separated):
+
+```bash
+# Exclude local overrides
+WORKTREE_ENV_EXCLUDE='.env.local' worktree-create my-feature
+
+# Exclude multiple patterns
+WORKTREE_ENV_EXCLUDE='.env.local,.env.test' worktree-create my-feature
+```
+
+### Examples
+
+```bash
+# Only sync production env files
+WORKTREE_ENV_PATTERN='.env.production*' worktree-create prod-test
+
+# Sync all config files except local ones
+WORKTREE_ENV_PATTERN='config.*' \
+WORKTREE_ENV_EXCLUDE='config.local' \
+worktree-create my-feature
+
+# Make it permanent in your shell profile
+echo 'export WORKTREE_ENV_PATTERN=".env"' >> ~/.bashrc
+```
+
+## Troubleshooting
+
+### "Lock file exists" Error
+
+**Symptom:**
+```
+Error: Another worktree operation is in progress
+If you're sure no other operation is running, remove: .git/worktree-tools.lock
+```
+
+**Cause:** Another worktree operation is running, or a previous operation crashed without releasing the lock.
+
+**Solution:**
+```bash
+# Check if another operation is actually running
+ps aux | grep worktree-create
+ps aux | grep worktree-manage
+
+# If nothing is running, remove the lock file
+rm .git/worktree-tools.lock
+
+# Try your operation again
+```
+
+### "Permission denied" on .env Files
+
+**Symptom:**
+```
+Warning: .env is world-readable (permissions: 644)
+```
+
+**Cause:** Your `.env` files have loose permissions that could expose sensitive data.
+
+**Solution:**
+```bash
+# Secure your .env files
+chmod 600 .env*
+
+# Verify the change
+ls -la .env*
+
+# Should show: -rw------- (600)
+```
+
+### Symlink Points to Wrong Location
+
+**Symptom:** `.env` file in worktree points to incorrect path or broken symlink.
+
+**Cause:** Worktree was moved, or original `.env` was deleted/renamed.
+
+**Solution:**
+```bash
+# Option 1: Materialize to make it independent
+worktree-manage materialize <branch-name>
+
+# Option 2: Recreate the symlink manually
+cd .worktrees/<branch-name>
+rm .env
+ln -sf ../../.env .env
+
+# Option 3: Recreate the worktree
+cd /path/to/main/repo
+worktree-manage remove <branch-name>
+worktree-create <branch-name>
+```
+
+### "Branch name invalid" Error
+
+**Symptom:**
+```
+Error: Invalid branch name: feature/../../../etc/passwd
+Branch names cannot contain: \ ~ ^ : ? * [ ] @{
+```
+
+**Cause:** Branch name contains prohibited characters or invalid sequences.
+
+**Solution:**
+```bash
+# Use only alphanumeric characters, dashes, and underscores
+worktree-create feature-auth     # ✓ Good
+worktree-create feature_auth     # ✓ Good
+worktree-create feature/auth     # ✓ Good (single slash OK)
+
+# Avoid special characters
+worktree-create "feature auth"   # ✗ Bad (spaces)
+worktree-create feature:auth     # ✗ Bad (colon)
+worktree-create feature..auth    # ✗ Bad (double dots)
+```
+
+### Worktree Shows Old/Stale Environment Variables
+
+**Symptom:** Environment variables in worktree don't match the main repo.
+
+**Cause:** `.env` file was materialized (converted from symlink to real file).
+
+**Solution:**
+```bash
+# Check if it's a symlink
+ls -la .worktrees/<branch-name>/.env
+
+# If it's NOT a symlink (-rw instead of lrw), recreate it
+cd .worktrees/<branch-name>
+rm .env
+ln -sf ../../.env .env
+
+# Or recreate the worktree entirely
+worktree-manage remove <branch-name>
+worktree-create <branch-name>
+```
+
 ## Requirements
 
 - Bash 4.0+

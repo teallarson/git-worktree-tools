@@ -2,6 +2,9 @@
 
 set -e
 
+# Configuration - can be overridden by environment variables
+ENV_FILE_PATTERN="${WORKTREE_ENV_PATTERN:-.env*}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -11,7 +14,7 @@ NC='\033[0m' # No Color
 
 usage() {
     cat << EOF
-Usage: $(basename "$0") <command> [OPTIONS]
+Usage: $(basename "${0}") <command> [OPTIONS]
 
 Manage git worktrees created by worktree-create.
 
@@ -24,38 +27,45 @@ Commands:
 Options:
     -h, --help              Show this help message
 
+Environment Variables:
+    WORKTREE_ENV_PATTERN    Pattern for env files (default: .env*)
+                            Example: WORKTREE_ENV_PATTERN='.env,.env.*'
+
 Examples:
     # List all worktrees
-    $(basename "$0") list
+    $(basename "${0}") list
 
     # Remove a worktree
-    $(basename "$0") remove feature-auth
+    $(basename "${0}") remove feature-auth
 
     # Convert symlinks to real files
-    $(basename "$0") materialize feature-auth
+    $(basename "${0}") materialize feature-auth
 
     # Convert symlinks in all worktrees
-    $(basename "$0") materialize-all
+    $(basename "${0}") materialize-all
+
+    # Use custom env file pattern
+    WORKTREE_ENV_PATTERN='.env' $(basename "${0}") list
 
 EOF
     exit 0
 }
 
 error() {
-    echo -e "${RED}Error: $1${NC}" >&2
+    echo -e "${RED}Error: ${1}${NC}" >&2
     exit 1
 }
 
 info() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}✓${NC} ${1}"
 }
 
 warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}⚠${NC} ${1}"
 }
 
 blue() {
-    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}${1}${NC}"
 }
 
 # Check if we're in a git repo
@@ -64,7 +74,83 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
 fi
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
-cd "$REPO_ROOT"
+cd "${REPO_ROOT}"
+
+# File-based locking to prevent race conditions
+LOCK_FILE="${REPO_ROOT}/.git/worktree-tools.lock"
+LOCK_FD=200
+
+acquire_lock() {
+    # Try to create lock file with current PID
+    local max_wait=10
+    local waited=0
+
+    while [[ -f "${LOCK_FILE}" ]]; do
+        if [[ ${waited} -ge ${max_wait} ]]; then
+            echo -e "${RED}Error: Another worktree operation is in progress${NC}" >&2
+            echo -e "${YELLOW}Lock file: ${LOCK_FILE}${NC}" >&2
+            echo -e "${YELLOW}If no other operation is running, remove: rm \"${LOCK_FILE}\"${NC}" >&2
+            exit 1
+        fi
+        sleep 1
+        ((waited++))
+    done
+
+    # Create lock file with PID
+    echo $$ > "${LOCK_FILE}"
+}
+
+release_lock() {
+    if [[ -f "${LOCK_FILE}" ]]; then
+        local lock_pid
+        lock_pid=$(cat "${LOCK_FILE}" 2>/dev/null || echo "")
+        # Only remove if we own the lock
+        if [[ "${lock_pid}" == "$$" ]]; then
+            rm -f "${LOCK_FILE}"
+        fi
+    fi
+}
+
+# Trap to ensure lock is released on exit
+trap release_lock EXIT INT TERM
+
+# Acquire lock before any operations
+acquire_lock
+
+# Validate branch name according to git rules
+validate_branch_name() {
+    local branch_name="${1}"
+
+    # Check if empty
+    if [[ -z "${branch_name}" ]]; then
+        error "Branch name cannot be empty"
+    fi
+
+    # Check length
+    if [[ ${#branch_name} -gt 255 ]]; then
+        error "Branch name too long (max 255 characters)"
+    fi
+
+    # Check for invalid characters per git-check-ref-format
+    # Cannot contain: \, ~, ^, :, ?, *, [, @{
+    # Cannot start or end with: /, .
+    # Cannot contain: //, .., @{
+    if [[ "${branch_name}" =~ [\\\~\^\:\?\*\[] ]] || \
+       [[ "${branch_name}" =~ ^[/.] ]] || \
+       [[ "${branch_name}" =~ [/.]$ ]] || \
+       [[ "${branch_name}" =~ \.\.|\@\{|// ]]; then
+        error "Invalid branch name: ${branch_name}
+Branch names cannot contain: \\ ~ ^ : ? * [ ] @{
+And cannot start/end with / or ."
+    fi
+
+    # Use git's own validation
+    if ! git check-ref-format --branch "${branch_name}" >/dev/null 2>&1; then
+        error "Invalid branch name according to git: ${branch_name}"
+    fi
+
+    return 0
+}
 
 list_worktrees() {
     echo ""
@@ -90,27 +176,35 @@ list_worktrees() {
 
     git worktree list | tail -n +2 | while read -r line; do
         # Parse worktree list output (format: path hash [branch])
-        worktree_path=$(echo "$line" | awk '{print $1}')
-        worktree_branch=$(echo "$line" | awk '{print $3}' | sed 's/\[//' | sed 's/\]//')
+        worktree_path=$(echo "${line}" | awk '{print $1}')
+        worktree_branch=$(echo "${line}" | awk '{print $3}' | sed 's/\[//' | sed 's/\]//')
 
-        if [[ ! -d "$worktree_path" ]]; then
+        if [[ ! -d "${worktree_path}" ]]; then
             continue
         fi
 
         env_count=0
         symlink_count=0
 
-        # Find .env files in this worktree
+        # Find .env files in this worktree (only regular files and symlinks, not directories)
         while IFS= read -r -d '' file; do
+            # Skip if it's a directory
+            if [[ -d "${file}" ]]; then
+                continue
+            fi
+            # Skip broken symlinks
+            if [[ -L "${file}" ]] && [[ ! -e "${file}" ]]; then
+                continue
+            fi
             ((env_count++))
-            if [[ -L "$file" ]]; then
+            if [[ -L "${file}" ]]; then
                 ((symlink_count++))
             fi
-        done < <(find "$worktree_path" -type f -o -type l -name ".env*" -print0 2>/dev/null)
+        done < <(find "${worktree_path}" -maxdepth 1 \( -type f -o -type l \) -name "${ENV_FILE_PATTERN}" -print0 2>/dev/null)
 
-        if [[ $env_count -gt 0 ]]; then
-            echo "  $worktree_branch:"
-            echo "    $env_count .env file(s), $symlink_count symlinked"
+        if [[ ${env_count} -gt 0 ]]; then
+            echo "  ${worktree_branch}:"
+            echo "    ${env_count} .env file(s), ${symlink_count} symlinked"
         fi
     done
 
@@ -118,83 +212,118 @@ list_worktrees() {
 }
 
 remove_worktree() {
-    local name="$1"
+    local name="${1}"
 
-    if [[ -z "$name" ]]; then
-        error "Worktree name is required. Usage: $(basename "$0") remove <name>"
+    if [[ -z "${name}" ]]; then
+        error "Worktree name is required. Usage: $(basename "${0}") remove <name>"
     fi
 
+    # Validate branch name
+    validate_branch_name "${name}"
+
     # Check if worktree exists
-    if ! git worktree list | grep -q "\[$name\]"; then
-        error "Worktree '$name' not found"
+    if ! git worktree list | grep -F "[$name]" > /dev/null; then
+        echo -e "${RED}Error: Worktree '${name}' not found${NC}" >&2
+        echo -e "${YELLOW}Available worktrees:${NC}" >&2
+        git worktree list | tail -n +2 | while read -r line; do
+            local branch=$(echo "${line}" | awk '{print $3}' | sed 's/\[//' | sed 's/\]//')
+            if [[ -n "${branch}" ]]; then
+                echo "  - ${branch}" >&2
+            fi
+        done
+        exit 1
     fi
 
     # Get worktree path
-    local worktree_path=$(git worktree list | grep "\[$name\]" | awk '{print $1}')
+    local worktree_path=$(git worktree list | grep -F "[$name]" | awk '{print $1}')
 
     echo ""
-    warn "This will remove the worktree at: $worktree_path"
+    warn "This will remove the worktree at: ${worktree_path}"
     read -p "Are you sure? (y/N) " -n 1 -r
     echo
 
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ! ${REPLY} =~ ^[Yy]$ ]]; then
         echo "Cancelled."
         exit 0
     fi
 
-    git worktree remove "$name"
-    info "Worktree '$name' removed"
+    git worktree remove "${name}"
+    info "Worktree '${name}' removed"
 
     # Ask if they want to delete the branch too
     echo ""
-    read -p "Delete the branch '$name' as well? (y/N) " -n 1 -r
+    read -p "Delete the branch '${name}' as well? (y/N) " -n 1 -r
     echo
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        git branch -d "$name" 2>/dev/null || git branch -D "$name"
-        info "Branch '$name' deleted"
+    if [[ ${REPLY} =~ ^[Yy]$ ]]; then
+        git branch -d "${name}" 2>/dev/null || git branch -D "${name}"
+        info "Branch '${name}' deleted"
     fi
 }
 
 materialize_worktree() {
-    local name="$1"
+    local name="${1}"
 
-    if [[ -z "$name" ]]; then
-        error "Worktree name is required. Usage: $(basename "$0") materialize <name>"
+    if [[ -z "${name}" ]]; then
+        error "Worktree name is required. Usage: $(basename "${0}") materialize <name>"
     fi
 
+    # Validate branch name
+    validate_branch_name "${name}"
+
     # Check if worktree exists
-    if ! git worktree list | grep -q "\[$name\]"; then
-        error "Worktree '$name' not found"
+    if ! git worktree list | grep -F "[$name]" > /dev/null; then
+        echo -e "${RED}Error: Worktree '${name}' not found${NC}" >&2
+        echo -e "${YELLOW}Available worktrees:${NC}" >&2
+        git worktree list | tail -n +2 | while read -r line; do
+            local branch=$(echo "${line}" | awk '{print $3}' | sed 's/\[//' | sed 's/\]//')
+            if [[ -n "${branch}" ]]; then
+                echo "  - ${branch}" >&2
+            fi
+        done
+        exit 1
     fi
 
     # Get worktree path
-    local worktree_path=$(git worktree list | grep "\[$name\]" | awk '{print $1}')
+    local worktree_path=$(git worktree list | grep -F "[$name]" | awk '{print $1}')
 
     echo ""
-    info "Converting symlinks to real files in: $worktree_path"
+    info "Converting symlinks to real files in: ${worktree_path}"
     echo ""
 
     local count=0
 
     # Find all symlinked .env files
     while IFS= read -r -d '' file; do
-        if [[ -L "$file" ]]; then
-            local target=$(readlink "$file")
+        # Skip if it's a directory
+        if [[ -d "${file}" ]]; then
+            continue
+        fi
+
+        if [[ -L "${file}" ]]; then
+            local target=$(readlink "${file}")
+
+            # Validate target exists
+            if [[ ! -f "${target}" ]]; then
+                warn "Symlink target does not exist: ${target}"
+                echo "  Skipping: ${file}"
+                continue
+            fi
+
             local rel_path="${file#$worktree_path/}"
 
             # Copy the target to replace the symlink
-            cp --remove-destination "$target" "$file"
+            cp --remove-destination "${target}" "${file}"
             ((count++))
-            echo "  📄 Materialized: $rel_path"
+            echo "  📄 Materialized: ${rel_path}"
         fi
-    done < <(find "$worktree_path" -type l -name ".env*" -print0 2>/dev/null)
+    done < <(find "${worktree_path}" -maxdepth 1 -type l -name "${ENV_FILE_PATTERN}" -print0 2>/dev/null)
 
     echo ""
-    if [[ $count -eq 0 ]]; then
+    if [[ ${count} -eq 0 ]]; then
         warn "No symlinked .env files found"
     else
-        info "Converted $count symlink(s) to real files"
+        info "Converted ${count} symlink(s) to real files"
     fi
 }
 
@@ -205,12 +334,12 @@ materialize_all() {
 
     local total_count=0
 
-    # Process each worktree (skip the main one)
-    git worktree list | tail -n +2 | while read -r line; do
-        worktree_path=$(echo "$line" | awk '{print $1}')
-        worktree_branch=$(echo "$line" | awk '{print $3}' | sed 's/\[//' | sed 's/\]//')
+    # Process each worktree (skip the main one) using process substitution to avoid subshell
+    while read -r line; do
+        local worktree_path=$(echo "${line}" | awk '{print $1}')
+        local worktree_branch=$(echo "${line}" | awk '{print $3}' | sed 's/\[//' | sed 's/\]//')
 
-        if [[ ! -d "$worktree_path" ]]; then
+        if [[ ! -d "${worktree_path}" ]]; then
             continue
         fi
 
@@ -218,39 +347,50 @@ materialize_all() {
 
         # Find all symlinked .env files
         while IFS= read -r -d '' file; do
-            if [[ -L "$file" ]]; then
-                local target=$(readlink "$file")
-                cp --remove-destination "$target" "$file"
+            # Skip if it's a directory
+            if [[ -d "${file}" ]]; then
+                continue
+            fi
+
+            if [[ -L "${file}" ]]; then
+                local target=$(readlink "${file}")
+
+                # Validate target exists
+                if [[ ! -f "${target}" ]]; then
+                    continue
+                fi
+
+                cp --remove-destination "${target}" "${file}"
                 ((count++))
             fi
-        done < <(find "$worktree_path" -type l -name ".env*" -print0 2>/dev/null)
+        done < <(find "${worktree_path}" -maxdepth 1 -type l -name "${ENV_FILE_PATTERN}" -print0 2>/dev/null)
 
-        if [[ $count -gt 0 ]]; then
-            echo "  $worktree_branch: $count file(s)"
+        if [[ ${count} -gt 0 ]]; then
+            echo "  ${worktree_branch}: ${count} file(s)"
             ((total_count += count))
         fi
-    done
+    done < <(git worktree list | tail -n +2)
 
     echo ""
-    if [[ $total_count -eq 0 ]]; then
+    if [[ ${total_count} -eq 0 ]]; then
         warn "No symlinked .env files found in any worktree"
     else
-        info "Total: converted $total_count symlink(s) to real files"
+        info "Total: converted ${total_count} symlink(s) to real files"
     fi
 }
 
 # Parse command
 COMMAND="${1:-}"
 
-case "$COMMAND" in
+case "${COMMAND}" in
     list)
         list_worktrees
         ;;
     remove)
-        remove_worktree "$2"
+        remove_worktree "${2}"
         ;;
     materialize)
-        materialize_worktree "$2"
+        materialize_worktree "${2}"
         ;;
     materialize-all)
         materialize_all
@@ -262,6 +402,6 @@ case "$COMMAND" in
         error "Command is required. Use -h for help."
         ;;
     *)
-        error "Unknown command: $COMMAND. Use -h for help."
+        error "Unknown command: ${COMMAND}. Use -h for help."
         ;;
 esac

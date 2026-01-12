@@ -2,6 +2,64 @@
 
 set -e
 
+# File-based locking to prevent race conditions
+LOCK_FILE=""
+LOCK_FD=200
+
+# Acquire lock to prevent concurrent operations
+acquire_lock() {
+    # Get git directory for lock file location
+    local git_dir
+    git_dir=$(git rev-parse --git-dir 2>/dev/null) || return 1
+    LOCK_FILE="${git_dir}/worktree-tools.lock"
+
+    # Try to acquire lock (compatible with systems without flock)
+    if command -v flock >/dev/null 2>&1; then
+        # Use flock if available (more reliable)
+        eval "exec ${LOCK_FD}>${LOCK_FILE}"
+        if ! flock -n ${LOCK_FD} 2>/dev/null; then
+            echo -e "\033[0;31mError: Another worktree operation is in progress\033[0m" >&2
+            echo -e "\033[1;33mIf you're sure no other operation is running, remove: ${LOCK_FILE}\033[0m" >&2
+            exit 1
+        fi
+    else
+        # Fallback to simple file-based locking
+        local max_wait=10
+        local waited=0
+
+        while [[ -f "${LOCK_FILE}" ]]; do
+            if [[ ${waited} -ge ${max_wait} ]]; then
+                echo -e "\033[0;31mError: Lock file exists after ${max_wait}s\033[0m" >&2
+                echo -e "\033[1;33mRemove ${LOCK_FILE} if no operation is running\033[0m" >&2
+                exit 1
+            fi
+            sleep 1
+            ((waited++))
+        done
+
+        # Create lock with PID
+        echo $$ > "${LOCK_FILE}"
+    fi
+}
+
+# Release lock on exit
+release_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        flock -u ${LOCK_FD} 2>/dev/null || true
+    fi
+    if [[ -n "${LOCK_FILE}" ]] && [[ -f "${LOCK_FILE}" ]]; then
+        # Only remove if we own it
+        local lock_pid
+        lock_pid=$(cat "${LOCK_FILE}" 2>/dev/null || echo "")
+        if [[ -z "${lock_pid}" ]] || [[ "${lock_pid}" == "$$" ]]; then
+            rm -f "${LOCK_FILE}" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Set trap to release lock on exit
+trap release_lock EXIT
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,6 +70,9 @@ NC='\033[0m' # No Color
 BASE_BRANCH="main"
 WORKTREE_ROOT=".worktrees"
 COPY_ENV=false
+
+# Configurable .env pattern (can be overridden by environment variable)
+ENV_FILE_PATTERN="${WORKTREE_ENV_PATTERN:-.env*}"
 
 usage() {
     cat << EOF
@@ -28,6 +89,9 @@ Options:
     -c, --copy-env          Copy .env files instead of symlinking
     -h, --help              Show this help message
 
+Environment Variables:
+    WORKTREE_ENV_PATTERN    Pattern for env files (default: .env*)
+
 Examples:
     # Create worktree 'feature-auth' from main
     $(basename "$0") feature-auth
@@ -41,33 +105,87 @@ Examples:
     # Copy .env files instead of symlinking
     $(basename "$0") --copy-env hotfix-123
 
+    # Use custom .env pattern
+    WORKTREE_ENV_PATTERN='.env.local' $(basename "$0") my-feature
+
 EOF
     exit 0
 }
 
 error() {
-    echo -e "${RED}Error: $1${NC}" >&2
+    echo -e "${RED}Error: ${1}${NC}" >&2
     exit 1
 }
 
 info() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}✓${NC} ${1}"
 }
 
 warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}⚠${NC} ${1}"
+}
+
+# Check .env file permissions for security
+check_env_permissions() {
+    local file="${1}"
+    local perms
+
+    # Get file permissions (macOS and Linux compatible)
+    if [[ "$(uname)" == "Darwin" ]]; then
+        perms=$(stat -f "%OLp" "${file}" 2>/dev/null)
+    else
+        perms=$(stat -c "%a" "${file}" 2>/dev/null)
+    fi
+
+    if [[ -z "${perms}" ]]; then
+        return 0  # Cannot check permissions, skip validation
+    fi
+
+    # Check if world-readable (last digit > 3)
+    local world_perms="${perms: -1}"
+    if [[ "${world_perms}" -gt 3 ]]; then
+        warn "File $(basename "${file}") is world-readable (permissions: ${perms})"
+        echo -e "${YELLOW}  Consider: chmod 600 ${file}${NC}"
+        return 1
+    fi
+    return 0
+}
+
+# Validate branch name according to git rules
+validate_branch_name() {
+    local branch_name="${1}"
+
+    # Check if empty
+    if [[ -z "${branch_name}" ]]; then
+        error "Branch name cannot be empty"
+    fi
+
+    # Check length (git ref name max is 255)
+    if [[ ${#branch_name} -gt 255 ]]; then
+        error "Branch name too long (max 255 characters)"
+    fi
+
+    # Use git's built-in validation
+    if ! git check-ref-format --branch "${branch_name}" >/dev/null 2>&1; then
+        echo -e "${RED}Error: Invalid branch name: ${branch_name}${NC}" >&2
+        echo -e "${YELLOW}Branch names cannot contain: \\ ~ ^ : ? * [ ] @{${NC}" >&2
+        echo -e "${YELLOW}And cannot start/end with / or .${NC}" >&2
+        exit 1
+    fi
+
+    return 0
 }
 
 # Parse arguments
 BRANCH_NAME=""
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "${1}" in
         -b|--base)
-            BASE_BRANCH="$2"
+            BASE_BRANCH="${2}"
             shift 2
             ;;
         -d|--dir)
-            WORKTREE_ROOT="$2"
+            WORKTREE_ROOT="${2}"
             shift 2
             ;;
         -c|--copy-env)
@@ -78,109 +196,193 @@ while [[ $# -gt 0 ]]; do
             usage
             ;;
         -*)
-            error "Unknown option: $1. Use -h for help."
+            error "Unknown option: ${1}. Use -h for help."
             ;;
         *)
-            BRANCH_NAME="$1"
+            BRANCH_NAME="${1}"
             shift
             ;;
     esac
 done
 
 # Validate branch name provided
-if [[ -z "$BRANCH_NAME" ]]; then
+if [[ -z "${BRANCH_NAME}" ]]; then
     error "Branch name is required. Use -h for help."
 fi
+
+# Validate branch name format
+validate_branch_name "${BRANCH_NAME}"
 
 # Check if we're in a git repo
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
     error "Not a git repository"
 fi
 
+# Acquire lock to prevent concurrent operations
+acquire_lock
+
 # Get repo root
 REPO_ROOT=$(git rev-parse --show-toplevel)
-cd "$REPO_ROOT"
+cd "${REPO_ROOT}"
+
+# Track created resources for rollback on error
+CREATED_WORKTREE=""
+CREATED_BRANCH=""
+
+# Cleanup function for error rollback
+cleanup_on_error() {
+    local exit_code=$?
+    if [[ ${exit_code} -ne 0 ]]; then
+        echo -e "${RED}Error occurred, cleaning up...${NC}" >&2
+
+        if [[ -n "${CREATED_WORKTREE}" ]]; then
+            echo -e "${YELLOW}Removing worktree: ${CREATED_WORKTREE}${NC}" >&2
+            git worktree remove "${CREATED_WORKTREE}" --force 2>/dev/null || true
+        fi
+
+        if [[ -n "${CREATED_BRANCH}" ]]; then
+            echo -e "${YELLOW}Removing branch: ${CREATED_BRANCH}${NC}" >&2
+            git branch -D "${CREATED_BRANCH}" 2>/dev/null || true
+        fi
+
+        echo -e "${RED}Cleanup complete. Please fix the error and try again.${NC}" >&2
+    fi
+}
+
+# Set trap for cleanup on error or interruption
+trap cleanup_on_error EXIT ERR INT TERM
 
 # Resolve worktree root (handle relative paths)
-if [[ "$WORKTREE_ROOT" = /* ]]; then
+if [[ "${WORKTREE_ROOT}" = /* ]]; then
     # Absolute path
-    WORKTREE_DIR="$WORKTREE_ROOT/$BRANCH_NAME"
+    WORKTREE_DIR="${WORKTREE_ROOT}/${BRANCH_NAME}"
 else
     # Relative to repo root
-    WORKTREE_DIR="$REPO_ROOT/$WORKTREE_ROOT/$BRANCH_NAME"
+    WORKTREE_DIR="${REPO_ROOT}/${WORKTREE_ROOT}/${BRANCH_NAME}"
+fi
+
+# Validate worktree path for security
+if [[ "${WORKTREE_DIR}" == *..* ]]; then
+    error "Worktree path cannot contain '..' (path traversal attempt detected)"
 fi
 
 # Check if base branch exists
-if ! git rev-parse --verify "$BASE_BRANCH" > /dev/null 2>&1; then
-    error "Base branch '$BASE_BRANCH' does not exist"
+if ! git rev-parse --verify "${BASE_BRANCH}" > /dev/null 2>&1; then
+    echo -e "${RED}Error: Base branch '${BASE_BRANCH}' does not exist${NC}" >&2
+    echo -e "${YELLOW}Available branches:${NC}" >&2
+    git branch -a | head -10 >&2
+    echo -e "${YELLOW}Tip: Use -b flag to specify a different base branch${NC}" >&2
+    exit 1
 fi
 
 # Check if worktree directory already exists
-if [[ -d "$WORKTREE_DIR" ]]; then
-    error "Worktree directory already exists: $WORKTREE_DIR"
+if [[ -d "${WORKTREE_DIR}" ]]; then
+    error "Worktree directory already exists: ${WORKTREE_DIR}"
 fi
 
 # Check if branch already exists
-if git rev-parse --verify "$BRANCH_NAME" > /dev/null 2>&1; then
-    warn "Branch '$BRANCH_NAME' already exists. Creating worktree from existing branch."
-    git worktree add "$WORKTREE_DIR" "$BRANCH_NAME"
+if git rev-parse --verify "${BRANCH_NAME}" > /dev/null 2>&1; then
+    warn "Branch '${BRANCH_NAME}' already exists. Creating worktree from existing branch."
+    git worktree add "${WORKTREE_DIR}" "${BRANCH_NAME}"
+    CREATED_WORKTREE="${WORKTREE_DIR}"
 else
-    info "Creating new branch '$BRANCH_NAME' from '$BASE_BRANCH'"
-    git worktree add -b "$BRANCH_NAME" "$WORKTREE_DIR" "$BASE_BRANCH"
+    info "Creating new branch '${BRANCH_NAME}' from '${BASE_BRANCH}'"
+    git worktree add -b "${BRANCH_NAME}" "${WORKTREE_DIR}" "${BASE_BRANCH}"
+    CREATED_WORKTREE="${WORKTREE_DIR}"
+    CREATED_BRANCH="${BRANCH_NAME}"
 fi
 
-info "Worktree created at: $WORKTREE_DIR"
+info "Worktree created at: ${WORKTREE_DIR}"
 
 # Find all .env* files in the main repo
 info "Looking for .env files..."
 ENV_FILES=()
 while IFS= read -r -d '' file; do
-    # Get relative path from repo root
-    REL_PATH="${file#$REPO_ROOT/}"
-
-    # Skip files that are already in a worktree directory
-    if [[ "$REL_PATH" == .worktrees/* ]] || [[ "$REL_PATH" == */.worktrees/* ]]; then
+    # Skip if not a regular file (handles directories, sockets, etc.)
+    if [[ ! -f "${file}" ]]; then
         continue
     fi
 
-    ENV_FILES+=("$REL_PATH")
-done < <(find "$REPO_ROOT" -type f -name ".env*" -print0 2>/dev/null)
+    # Skip if it's a broken symlink
+    if [[ -L "${file}" ]] && [[ ! -e "${file}" ]]; then
+        warn "Skipping broken symlink: $(basename "${file}")"
+        continue
+    fi
+
+    # Get relative path from repo root
+    REL_PATH="${file#${REPO_ROOT}/}"
+
+    # Skip files that are already in a worktree directory
+    if [[ "${REL_PATH}" == .worktrees/* ]] || [[ "${REL_PATH}" == */.worktrees/* ]]; then
+        continue
+    fi
+
+    ENV_FILES+=("${REL_PATH}")
+done < <(find "${REPO_ROOT}" -name "${ENV_FILE_PATTERN}" -print0 2>/dev/null)
 
 if [[ ${#ENV_FILES[@]} -eq 0 ]]; then
     warn "No .env files found in repository"
 else
     info "Found ${#ENV_FILES[@]} .env file(s)"
 
+    # Check permissions before creating symlinks
+    if [[ "${COPY_ENV}" == false ]]; then
+        permission_warnings=0
+        for env_file in "${ENV_FILES[@]}"; do
+            SRC="${REPO_ROOT}/${env_file}"
+            if ! check_env_permissions "${SRC}"; then
+                ((permission_warnings++))
+            fi
+        done
+
+        if [[ "${permission_warnings}" -gt 0 ]]; then
+            echo ""
+            warn "Found ${permission_warnings} file(s) with loose permissions"
+            echo -ne "${YELLOW}Continue anyway? (y/N): ${NC}"
+            read -r REPLY
+            if [[ ! "${REPLY}" =~ ^[Yy]$ ]]; then
+                error "Aborted due to permission concerns"
+            fi
+        fi
+    fi
+
+    # Process .env files
     for env_file in "${ENV_FILES[@]}"; do
-        SRC="$REPO_ROOT/$env_file"
-        DEST="$WORKTREE_DIR/$env_file"
-        DEST_DIR=$(dirname "$DEST")
+        SRC="${REPO_ROOT}/${env_file}"
+        DEST="${WORKTREE_DIR}/${env_file}"
+        DEST_DIR=$(dirname "${DEST}")
 
         # Create destination directory if needed
-        mkdir -p "$DEST_DIR"
+        mkdir -p "${DEST_DIR}"
 
-        if [[ "$COPY_ENV" == true ]]; then
-            cp "$SRC" "$DEST"
-            echo "  📄 Copied: $env_file"
+        if [[ "${COPY_ENV}" == true ]]; then
+            cp "${SRC}" "${DEST}"
+            echo "  📄 Copied: ${env_file}"
         else
-            ln -s "$SRC" "$DEST"
-            echo "  🔗 Linked: $env_file"
+            ln -s "${SRC}" "${DEST}"
+            echo "  🔗 Linked: ${env_file}"
         fi
     done
 fi
+
+# Success - clear the trap to prevent cleanup
+trap - EXIT ERR INT TERM
+CREATED_WORKTREE=""
+CREATED_BRANCH=""
 
 echo ""
 info "Worktree setup complete!"
 echo ""
 echo "To start working:"
-echo "  cd $WORKTREE_DIR"
+echo "  cd ${WORKTREE_DIR}"
 echo ""
-if [[ "$COPY_ENV" == false ]] && [[ ${#ENV_FILES[@]} -gt 0 ]]; then
+if [[ "${COPY_ENV}" == false ]] && [[ ${#ENV_FILES[@]} -gt 0 ]]; then
     echo "Note: .env files are symlinked. Changes will affect the main repo."
     echo "To convert symlinks to real files:"
-    echo "  ./worktree-manage materialize $BRANCH_NAME"
+    echo "  ./worktree-manage materialize ${BRANCH_NAME}"
 fi
 echo ""
 echo "Manage worktrees:"
 echo "  ./worktree-manage list              # List all worktrees"
 echo "  ./worktree-manage remove <name>     # Remove a worktree"
+echo ""
